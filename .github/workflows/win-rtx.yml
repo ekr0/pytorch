@@ -9,7 +9,7 @@ on:
       - main
 
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}-${{ github.event_name == 'schedule' }}
   cancel-in-progress: true
 
 permissions:
@@ -28,6 +28,7 @@ jobs:
       cuda-version: "12.8"
       python-version: "3.12"
       runner: "rtx-40x0-build"
+      aws-role-to-assume: arn:aws:iam::308535385114:role/gha_workflow_s3_and_ecr_read_only
       cuda-arch-list: "8.9;12.0"
       runner-machine: "nvidia"
       test-matrix: |
@@ -52,6 +53,7 @@ jobs:
       cuda-version: 12.8
       cuda-arch-list: "8.9"
       disable-monitor: true
+      aws-role-to-assume: arn:aws:iam::308535385114:role/gha_workflow_s3_and_ecr_read_only
       test-matrix: ${{ needs.win_vs2022_cuda12_8_py3_build_sm89.outputs.test-matrix }}
       timeout-minutes: 240
     secrets: inherit
@@ -66,6 +68,7 @@ jobs:
       cuda-version: "12.8"
       runner-machine: "nvidia"
       runner: "rtx-50x0-build"
+      aws-role-to-assume: arn:aws:iam::308535385114:role/gha_workflow_s3_and_ecr_read_only
       python-version: "3.12"
       cuda-arch-list: "8.9;12.0"
       test-matrix: |
@@ -90,6 +93,7 @@ jobs:
       cuda-version: 12.8
       cuda-arch-list: "12.0"
       disable-monitor: true
+      aws-role-to-assume: arn:aws:iam::308535385114:role/gha_workflow_s3_and_ecr_read_only
       test-matrix: ${{ needs.win_vs2022_cuda12_8_py3_build_sm120.outputs.test-matrix }}
       timeout-minutes: 240
     secrets: inherit
