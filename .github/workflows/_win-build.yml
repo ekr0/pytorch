@@ -151,6 +151,7 @@ jobs:
           cuda-version: ${{ inputs.cuda-version }}
 
       - name: configure aws credentials
+        continue-on-error: true
         if: ${{ inputs.aws-role-to-assume != '' || inputs.runner-machine == 'nvidia' }}
         id: aws_creds
         uses: aws-actions/configure-aws-credentials@ececac1a45f3b08a01d2dd070d28d111c5fe6722 # v4.1.0
@@ -275,8 +276,14 @@ jobs:
           echo "Collected CUDA libs and DLLs:"
           ls -lah /c/${{ github.run_id }}/build-results/*.lib /c/${{ github.run_id }}/build-results/*.dll 2>/dev/null || true
 
+      - name: Save Build artifacts to local storage
+        if: ${{ inputs.runner-machine == 'nvidia' && steps.build.outcome != 'skipped' }}
+        shell: bash
+        run: /c/upload-build-artifacts.sh ${{ github.run_id }} ${{ inputs.build-environment }} /c/${{ github.run_id }}
+
       # Upload to github so that people can click and download artifacts
       - name: Upload artifacts to s3
+        continue-on-error: true
         if: steps.build.outcome != 'skipped'
         uses: seemethere/upload-artifact-s3@baba72d0712b404f646cebe0730933554ebce96a # v5.1.0
         with:
