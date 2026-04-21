@@ -381,6 +381,9 @@ cmake_dependent_option(
 cmake_dependent_option(
     USE_TENSORPIPE "Use TensorPipe. Only available if USE_DISTRIBUTED is on." ON
     "USE_DISTRIBUTED AND NOT WIN32" OFF)
+cmake_dependent_option(
+    USE_TORCHCOMMS "Use TorchComms package support. Only available if USE_DISTRIBUTED is on." OFF
+    "USE_DISTRIBUTED" OFF)
 option(ONNX_ML "Enable traditional ONNX ML API." ON)
 option(HAVE_SOVERSION "Whether to add SOVERSION to the shared objects" OFF)
 option(BUILD_LIBTORCH_CPU_WITH_DEBUG

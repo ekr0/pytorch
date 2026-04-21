@@ -324,6 +324,14 @@ from tools.setup_helpers.env import (
     IS_LINUX,
     IS_WINDOWS,
 )
+from tools.setup_helpers.torchcomms import (
+    build_torchcomms,
+    get_torchcomms_backend_entry_points,
+    get_torchcomms_extensions,
+    get_torchcomms_package_data,
+    get_torchcomms_packages,
+    TorchCommsCMakeExtension,
+)
 
 
 def str2bool(value: str | None) -> bool:
@@ -469,6 +477,7 @@ else:
 TORCH_DIR = CWD / "torch"
 TORCH_LIB_DIR = TORCH_DIR / "lib"
 THIRD_PARTY_DIR = CWD / "third_party"
+
 
 # CMAKE: full path to python library
 if IS_WINDOWS:
@@ -1243,10 +1252,24 @@ class build_ext(setuptools.command.build_ext.build_ext):
             self.copy_file(omp_h, target_omp_h)
             break
 
+    def _build_torchcomms_extensions(self, ext: TorchCommsCMakeExtension) -> None:
+        if self._torchcomms_built:
+            return
+        build_torchcomms(
+            ext,
+            self,
+            get_cmake_cache_vars(),
+            cmake._cmake_command,
+            report,
+            IS_WINDOWS,
+        )
+        self._torchcomms_built = True
+
     def run(self) -> None:
         # Report build options. This is run after the build completes so # `CMakeCache.txt` exists
         # and we can get an accurate report on what is used and what is not.
         cmake_cache_vars = get_cmake_cache_vars()
+        self._torchcomms_built = False
         if cmake_cache_vars["USE_NUMPY"]:
             report("-- Building with NumPy bindings")
         else:
@@ -1299,6 +1322,7 @@ class build_ext(setuptools.command.build_ext.build_ext):
                 report(f"  -- USE_TENSORPIPE={cmake_cache_vars['USE_TENSORPIPE']}")
                 report(f"  -- USE_GLOO={cmake_cache_vars['USE_GLOO']}")
                 report(f"  -- USE_MPI={cmake_cache_vars['USE_OPENMPI']}")
+                report(f"  -- USE_TORCHCOMMS={cmake_cache_vars['USE_TORCHCOMMS']}")
         else:
             report("-- Building without distributed package")
         if cmake_cache_vars["STATIC_DISPATCH_BACKEND"]:
@@ -1350,9 +1374,18 @@ class build_ext(setuptools.command.build_ext.build_ext):
 
         super().build_extensions()
 
+    def build_extension(self, ext: Extension) -> None:
+        if isinstance(ext, TorchCommsCMakeExtension):
+            self._build_torchcomms_extensions(ext)
+            return
+
+        super().build_extension(ext)
+
     def get_outputs(self) -> list[str]:
         outputs = super().get_outputs()
         outputs.append(os.path.join(self.build_lib, "caffe2"))
+        if get_cmake_cache_vars()["USE_TORCHCOMMS"]:
+            outputs.append(os.path.join(self.build_lib, "torchcomms"))
         report(f"setup.py::get_outputs returning {outputs}")
         return outputs
 
@@ -1484,6 +1517,7 @@ def configure_extension_build() -> tuple[
     list[Extension],  # ext_modules
     dict[str, type[Command]],  # cmdclass
     list[str],  # packages
+    dict[str, str],  # package_dir
     dict[str, list[str]],  # entry_points
     list[str],  # extra_install_requires
 ]:
@@ -1598,11 +1632,16 @@ def configure_extension_build() -> tuple[
     includes = ["torch", "torch.*", "torchgen", "torchgen.*"]
     # exclude folders that they look like Python packages but are not wanted in wheels
     excludes = ["tools", "tools.*", "caffe2", "caffe2.*"]
+    package_dir: dict[str, str] = {}
     if cmake_cache_vars["BUILD_FUNCTORCH"]:
         includes.extend(["functorch", "functorch.*"])
     else:
         excludes.extend(["functorch", "functorch.*"])
     packages = find_packages(include=includes, exclude=excludes)
+    if cmake_cache_vars["USE_TORCHCOMMS"]:
+        torchcomms_packages, torchcomms_package_dir = get_torchcomms_packages()
+        packages = sorted(set(packages + torchcomms_packages))
+        package_dir.update(torchcomms_package_dir)
     C = Extension(
         "torch._C",
         libraries=main_libraries,
@@ -1621,6 +1660,7 @@ def configure_extension_build() -> tuple[
         ],
     )
     ext_modules.append(C)
+    ext_modules.extend(get_torchcomms_extensions(cmake_cache_vars))
 
     cmdclass = {
         "bdist_wheel": bdist_wheel,
@@ -1643,7 +1683,19 @@ def configure_extension_build() -> tuple[
         entry_points["console_scripts"].append(
             "torchfrtrace = torch.distributed.flight_recorder.fr_trace:main",
         )
-    return ext_modules, cmdclass, packages, entry_points, extra_install_requires
+    torchcomms_backend_entry_points = get_torchcomms_backend_entry_points(
+        cmake_cache_vars
+    )
+    if torchcomms_backend_entry_points:
+        entry_points["torchcomms.backends"] = torchcomms_backend_entry_points
+    return (
+        ext_modules,
+        cmdclass,
+        packages,
+        package_dir,
+        entry_points,
+        extra_install_requires,
+    )
 
 
 # post run, warnings, printed at the end to make them more visible
@@ -1708,6 +1760,7 @@ def main() -> None:
         ext_modules,
         cmdclass,
         packages,
+        package_dir,
         entry_points,
         extra_install_requires,
     ) = configure_extension_build()
@@ -1797,6 +1850,8 @@ def main() -> None:
     package_data = {
         "torch": torch_package_data,
     }
+    if get_cmake_cache_vars()["USE_TORCHCOMMS"]:
+        package_data.update(get_torchcomms_package_data())
     # some win libraries are excluded
     # these are statically linked
     exclude_windows_libs = [
@@ -1823,6 +1878,7 @@ def main() -> None:
         ext_modules=ext_modules,
         cmdclass=cmdclass,
         packages=packages,
+        package_dir=package_dir,
         entry_points=entry_points,
         install_requires=install_requires,
         package_data=package_data,
