@@ -24,7 +24,66 @@ using torch::utils::PyObjectPreservation;
 
 namespace torch::autograd {
 
+int traverse_node(
+    c10::intrusive_ptr<Node>& fn_ptr,
+    visitproc visit,
+    void* arg) {
+  if (fn_ptr.use_count() != 1) {
+    return 0;
+  }
+  auto& fn = *fn_ptr;
+  // The fields traversed below are owned by the cpp grad_fn, which we own a
+  // reference to. We should only them traverse however if we are the only
+  // owner of the grad_fn, otherwise we risk prematurely gc'ing the grad_fn.
+  //
+  // See: https://github.com/pytorch/pytorch/issues/102174
+  for (const auto& hook : fn.tensor_pre_hooks()) {
+    if (auto pyhook = dynamic_cast<PyFunctionTensorPreHook*>(hook.get())) {
+      Py_VISIT(pyhook->dict);
+    }
+  }
+  // NOTE [retains_grad_hook PyObject traversal]
+  // In theory this shouldn't be necessary, because retains_grad_hooks should
+  // not contain any PyFunctionTensorPreHooks. The alternative is to have a
+  // check that actually guarantees this.
+  for (const auto& pair : fn.retains_grad_hooks()) {
+    if (auto pyhook =
+            dynamic_cast<PyFunctionTensorPreHook*>(pair.second.get())) {
+      Py_VISIT(pyhook->dict);
+    }
+  }
+  for (const auto& hook : fn.pre_hooks()) {
+    if (auto pyhook = dynamic_cast<PyFunctionPreHook*>(hook.get())) {
+      Py_VISIT(pyhook->dict);
+    }
+  }
+  for (const auto& hook : fn.post_hooks()) {
+    if (auto pyhook = dynamic_cast<PyFunctionPostHook*>(hook.get())) {
+      Py_VISIT(pyhook->dict);
+    }
+  }
+  return 0;
+}
+
 namespace {
+
+int THPCppFunction_traverse(PyObject* self, visitproc visit, void* arg) {
+  auto* cpp_fn = reinterpret_cast<THPCppFunction*>(self);
+  return traverse_node(cpp_fn->cdata, visit, arg);
+}
+
+void THPCppFunction_dealloc(PyObject* self) {
+  PyObject_GC_UnTrack(self);
+  auto* cpp_fn = reinterpret_cast<THPCppFunction*>(self);
+  if (cpp_fn->cdata) {
+    auto* slot = cpp_fn->cdata->pyobj_slot();
+    if (slot->load_pyobj() == self) {
+      slot->store_pyobj(nullptr);
+    }
+  }
+  cpp_fn->cdata.~intrusive_ptr();
+  Py_TYPE(self)->tp_free(self);
+}
 
 PyObject* THPCppFunction_call(
     PyObject* self,
@@ -74,62 +133,6 @@ PyObject* THPCppFunction_call(
     PyTuple_SET_ITEM(tuple.get(), i, THPVariable_Wrap(output[i]));
   }
   return tuple.release();
-}
-
-int THPCppFunction_traverse(PyObject* self, visitproc visit, void* arg) {
-  if ((((THPCppFunction*)self)->cdata).use_count() == 1) {
-    // The fields traversed below are owned by the cpp grad_fn, which we own a
-    // reference to. We should only them traverse however if we are the only
-    // owner of the grad_fn, otherwise we risk prematurely gc'ing the grad_fn.
-    //
-    // See: https://github.com/pytorch/pytorch/issues/102174
-    auto& fn = *((THPCppFunction*)self)->cdata;
-    for (const auto& hook : fn.tensor_pre_hooks()) {
-      if (auto pyhook = dynamic_cast<PyFunctionTensorPreHook*>(hook.get())) {
-        Py_VISIT(pyhook->dict);
-      }
-    }
-    // NOTE [retains_grad_hook PyObject traversal]
-    // In theory this shouldn't be necessary, because retains_grad_hooks should
-    // not contain any PyFunctionTensorPreHooks. The alternative is to have a
-    // check that actually guarantees this.
-    for (const auto& pair : fn.retains_grad_hooks()) {
-      if (auto pyhook =
-              dynamic_cast<PyFunctionTensorPreHook*>(pair.second.get())) {
-        Py_VISIT(pyhook->dict);
-      }
-    }
-    for (const auto& hook : fn.pre_hooks()) {
-      if (auto pyhook = dynamic_cast<PyFunctionPreHook*>(hook.get())) {
-        Py_VISIT(pyhook->dict);
-      }
-    }
-    for (const auto& hook : fn.post_hooks()) {
-      if (auto pyhook = dynamic_cast<PyFunctionPostHook*>(hook.get())) {
-        Py_VISIT(pyhook->dict);
-      }
-    }
-  }
-  return 0;
-}
-
-int THPCppFunction_clear(PyObject* self) {
-  auto f = (THPCppFunction*)self;
-  if (f->cdata) {
-    auto* slot = f->cdata->pyobj_slot();
-    if (slot->load_pyobj() == self) {
-      slot->store_pyobj(nullptr);
-    }
-  }
-  f->cdata.reset();
-  return 0;
-}
-
-void THPCppFunction_dealloc(PyObject* self) {
-  PyObject_GC_UnTrack(self);
-  THPCppFunction_clear(self);
-  ((THPCppFunction*)self)->cdata.~intrusive_ptr();
-  Py_TYPE(self)->tp_free(self);
 }
 
 } // namespace
@@ -263,7 +266,6 @@ PyTypeObject* _initFunctionPyTypeObject(
       function_properties ? function_properties : default_properties;
   type.tp_dealloc = THPCppFunction_dealloc;
   type.tp_traverse = THPCppFunction_traverse;
-  type.tp_clear = THPCppFunction_clear;
   if (PyType_Ready(&type) < 0) {
     TORCH_CHECK(false, "Unable to instantiate PyTypeObject for ", name);
   }
@@ -289,12 +291,6 @@ static PyTypeObject* get_default_type() {
 PyObject* functionToPyObject(const c10::intrusive_ptr<Node>& cdata) {
   if (!cdata) {
     Py_RETURN_NONE;
-  }
-
-  if (auto pfw = dynamic_cast<PyNode*>(cdata.get())) {
-    PyObject* obj = pfw->obj;
-    Py_INCREF(obj);
-    return obj;
   }
 
   return PyObjectPreservation::get_or_init(*cdata, [&]() {
