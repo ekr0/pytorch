@@ -12,6 +12,7 @@ import operator
 import os
 import pprint
 import textwrap
+import time
 import traceback
 import typing
 from collections import Counter, defaultdict
@@ -5090,12 +5091,43 @@ class Scheduler:
 
     def create_combo_kernel_nodes(self, num_ck_nodes: int | None = None) -> None:
         """
-        Groups parallel nodes
+        Groups parallel nodes into combo kernels (ForeachKernelSchedulerNode).
+
+        When either combo_kernel_peak_memory_threshold (absolute bytes) or
+        combo_kernel_peak_memory_pct_threshold (fraction of baseline peak) is
+        set, each candidate group is simulated before creation. A group is
+        accepted iff the simulated graph peak delta satisfies every threshold
+        that is set. On rejection, the group's schedule-index span is halved
+        and the reduced group is retried (worst-case O(log initial_span)
+        retries).
+
+        The peak is computed locally (per-region) by reusing the cached
+        baseline memory timeline, so per-group cost is O(region_size +
+        buffers_touching_region) instead of O(N + B).
         """
         fused_nodes = OrderedSet(self.nodes)
         count = 0
         num_nodes_orig = len(self.nodes)
         log.debug("ComboKernels: Generating with num_ck_nodes = %s...", num_ck_nodes)
+        enable_autotune = config.combo_kernels_autotune > 0
+
+        abs_thr = config.combo_kernel_peak_memory_threshold
+        pct_thr = config.combo_kernel_peak_memory_pct_threshold
+        memory_check = abs_thr > 0 or pct_thr > 0
+        baseline_peak = 0
+        memory_sim_time = 0.0
+        mem_ctx = None
+        if memory_check:
+            mem_ctx = self._init_peak_memory_context()
+            baseline_peak = mem_ctx["baseline_peak"]
+            log.debug(
+                "ComboKernels memory-aware: baseline peak = %d bytes "
+                "(abs_thr=%d, pct_thr=%g)",
+                baseline_peak,
+                abs_thr,
+                pct_thr,
+            )
+
         for num, node_list in enumerate(
             ForeachKernelSchedulerNode.group_nodes_for_combo_kernels(self)
         ):
@@ -5107,14 +5139,71 @@ class Scheduler:
             if not self.speedup_by_combo_kernel(node_list):
                 log.debug("ComboKernels: Not speeding up %d-th group", num)
                 continue
+
+            if memory_check:
+                assert mem_ctx is not None
+                sim_start = time.perf_counter()
+                (
+                    combo_node,
+                    new_peak,
+                    new_region_memory,
+                    region_start,
+                ) = self._try_combo_with_memory_check(
+                    node_list,
+                    mem_ctx,
+                    baseline_peak,
+                    enable_autotune,
+                )
+                # Rejected — retry with the region's node-index span halved.
+                # Keep only the earliest half of the group; halve again if
+                # no node was dropped. Worst-case O(log initial_span) retries.
+                if combo_node is None:
+                    node_to_idx = mem_ctx["node_to_idx"]
+                    indices = sorted(node_to_idx[n] for n in node_list)
+                    first_idx = indices[0]
+                    cur_span = indices[-1] - first_idx
+                    while cur_span > 0:
+                        cur_span //= 2
+                        cutoff = first_idx + cur_span
+                        candidate = [n for n in node_list if node_to_idx[n] <= cutoff]
+                        if len(candidate) < 2:
+                            break  # can't combo a singleton
+                        if len(candidate) == len(node_list):
+                            continue  # halving didn't drop any node; halve more
+                        (
+                            combo_node,
+                            new_peak,
+                            new_region_memory,
+                            region_start,
+                        ) = self._try_combo_with_memory_check(
+                            candidate,
+                            mem_ctx,
+                            baseline_peak,
+                            enable_autotune,
+                        )
+                        if combo_node is not None:
+                            node_list = candidate
+                            break
+                memory_sim_time += time.perf_counter() - sim_start
+                if combo_node is None:
+                    continue
+                # Update running peak and refresh the cached per-step memory
+                # profile for the accepted region. This keeps carry_in
+                # correct for subsequent groups whose regions may overlap.
+                baseline_peak = new_peak
+                assert new_region_memory is not None
+                self._commit_combo_to_memory_context(
+                    mem_ctx, region_start, new_region_memory, node_list
+                )
+            else:
+                combo_node = ForeachKernelSchedulerNode(
+                    node_list[0].scheduler,
+                    node_list,
+                    use_custom_partition_algo=True,
+                    enable_autotune=enable_autotune,
+                )
+
             count += 1
-            enable_autotune = config.combo_kernels_autotune > 0
-            group_snode = ForeachKernelSchedulerNode(
-                node_list[0].scheduler,
-                node_list,
-                use_custom_partition_algo=True,
-                enable_autotune=enable_autotune,
-            )
             log.info(
                 "ComboKernels: Combining %d nodes for %d-th group",
                 len(node_list),
@@ -5122,15 +5211,16 @@ class Scheduler:
             )
             for node in node_list:
                 fused_nodes.remove(node)
-            fused_nodes.add(group_snode)
+            fused_nodes.add(combo_node)
             self.name_to_fused_node.update(
-                {n.get_name(): group_snode for n in group_snode.get_nodes()}
+                {n.get_name(): combo_node for n in combo_node.get_nodes()}
             )
             # Propagate stream assignment so codegen can place the combo
             # kernel in the correct stream context.
             stream = self.node_to_stream.get(node_list[0])
             if stream is not None:
-                self.node_to_stream[group_snode] = stream
+                self.node_to_stream[combo_node] = stream
+
         self.nodes = sorted(fused_nodes, key=lambda x: x.min_order)
         self.nodes = self.topological_sort_schedule(self.nodes)
         log.info(
@@ -5139,7 +5229,328 @@ class Scheduler:
             num_nodes_orig,
             len(self.nodes),
         )
+        if memory_check:
+            log.info(
+                "ComboKernels memory-aware: %.3fs spent in peak simulation",
+                memory_sim_time,
+            )
         self.prune_redundant_deps(self.nodes)
+
+    def _init_peak_memory_context(self) -> dict[str, Any]:
+        """One-time setup for memory-aware combo kernel creation.
+
+        Runs the buffer/node memory-planning passes once and computes the
+        baseline timeline (buf_info_list, peak, memories_at_nodes) in a
+        single pass, instead of re-running the timeline twice.
+        """
+        from .memory import (
+            assign_memory_planning_info_for_scheduler_buffers,
+            assign_memory_planning_info_for_scheduler_nodes,
+            compute_memory_timeline,
+            get_freeable_input_buf,
+        )
+
+        graph_inputs = OrderedSet(V.graph.graph_inputs.keys())
+        graph_outputs = OrderedSet(V.graph.get_output_names())
+
+        name_to_freeable = get_freeable_input_buf(self.nodes, graph_inputs)
+        assign_memory_planning_info_for_scheduler_buffers(self.nodes, self.name_to_buf)
+        assign_memory_planning_info_for_scheduler_nodes(
+            self.nodes,
+            self.name_to_fused_node,
+            self.name_to_buf,
+            name_to_freeable,
+        )
+        buf_info_list, _, _ = compute_memory_timeline(
+            self.nodes, name_to_freeable, graph_outputs
+        )
+        N = len(self.nodes)
+        delta = [0] * (N + 1)
+        for bi in buf_info_list:
+            delta[bi.start_step] += bi.size_alloc
+            delta[bi.end_step + 1] -= bi.size_free
+        memories_at_nodes = [0] * (N + 1)
+        baseline_peak = 0
+        cur = 0
+        for t in range(N + 1):
+            cur += delta[t]
+            memories_at_nodes[t] = cur
+            if cur > baseline_peak:
+                baseline_peak = cur
+        return {
+            "baseline_peak": baseline_peak,
+            "graph_outputs": graph_outputs,
+            "buf_info_list": buf_info_list,
+            "memories_at_nodes": memories_at_nodes,
+            "node_to_idx": {node: idx for idx, node in enumerate(self.nodes)},
+            # sub_node -> accepted-combo step in the (logical) post-fusion
+            # schedule. Populated by _commit_combo_to_memory_context.
+            "accepted_step": {},
+        }
+
+    def _try_combo_with_memory_check(
+        self,
+        group_nodes: list[BaseSchedulerNode],
+        mem_ctx: dict[str, Any],
+        baseline_peak: int,
+        enable_autotune: bool,
+    ) -> tuple[ForeachKernelSchedulerNode | None, int, list[int] | None, int]:
+        """Try forming a combo from group_nodes; reject on memory growth.
+
+        Returns:
+            combo_node: the proposed combo, or None if rejected.
+            new_peak: updated running graph peak (== baseline_peak on reject).
+            new_region_memory: per-step memory inside the combo's region in
+                the new schedule (length = region_size + 1). None on reject.
+                Used by the caller to refresh ``mem_ctx['memories_at_nodes']``
+                so subsequent groups see the post-fusion memory profile (this
+                matters when group regions overlap in node-index span).
+            region_start: first index of the combo's region. Meaningful only
+                when accepted.
+        """
+        # Constructing a ForeachKernelSchedulerNode is pure: it doesn't register
+        # anywhere or mutate name_to_buf / scheduler state. Safe to discard if
+        # the memory check rejects the group.
+        combo_node = ForeachKernelSchedulerNode(
+            group_nodes[0].scheduler,
+            group_nodes,
+            use_custom_partition_algo=True,
+            enable_autotune=enable_autotune,
+        )
+
+        node_to_idx = mem_ctx["node_to_idx"]
+        region_start = min(node_to_idx[n] for n in group_nodes)
+        region_end = max(node_to_idx[n] for n in group_nodes)
+
+        # Build local_nodes: the region with group nodes replaced by combo.
+        # Only this slice needs re-sorting; outer schedule is unchanged.
+        group_set = OrderedSet(group_nodes)
+        local_nodes: list[BaseSchedulerNode] = [combo_node]
+        for i in range(region_start, region_end + 1):
+            if self.nodes[i] not in group_set:
+                local_nodes.append(self.nodes[i])
+        local_nodes = self.topological_sort_schedule(local_nodes)
+
+        # Map each node to its step in the new (modified) schedule.
+        # Nodes inside the region get their new position; group sub-nodes
+        # map to their combo node's step. Nodes outside the region keep
+        # their baseline step (looked up via node_to_idx in step_of).
+        new_step: dict[BaseSchedulerNode, int] = {
+            node: region_start + i for i, node in enumerate(local_nodes)
+        }
+        combo_step = new_step[combo_node]
+        for node in group_nodes:
+            new_step[node] = combo_step
+
+        name_to_fused_node = self.name_to_fused_node
+        accepted_step = mem_ctx["accepted_step"]
+
+        def step_of(node: BaseSchedulerNode) -> int:
+            s = new_step.get(node)
+            if s is not None:
+                return s
+            # If this node was already absorbed into an earlier accepted
+            # combo, use that combo's logical step (not the sub-node's
+            # baseline step).
+            s = accepted_step.get(node)
+            if s is not None:
+                return s
+            if node in node_to_idx:
+                return node_to_idx[node]
+            # Buffer's defining_op or succ_node may be an inner node of a
+            # FusedSchedulerNode (produced by Inductor's earlier fusion pass).
+            # Resolve to the top-level scheduler node via name_to_fused_node.
+            top = name_to_fused_node.get(node.get_name())
+            if top is not None:
+                if top in new_step:
+                    return new_step[top]
+                if top in accepted_step:
+                    return accepted_step[top]
+                if top in node_to_idx:
+                    return node_to_idx[top]
+            # Node unreachable in the current schedule — treat as step 0.
+            return 0
+
+        # Walk only buffers whose alloc OR free is within the region in the
+        # new schedule. Outer-region memory is identical to baseline (nodes
+        # outside the region don't move), so we only need region_delta here;
+        # outer_peak is handled below via baseline_peak.
+        region_size = region_end - region_start + 1
+        region_delta = [0] * (region_size + 1)
+
+        def accumulate(
+            size_alloc: int, size_free: int, new_start: int, new_end: int
+        ) -> None:
+            if region_start <= new_start <= region_end:
+                region_delta[new_start - region_start] += size_alloc
+            # Free happens at end_step + 1. If end_step is still in region,
+            # the free lands at region_start..region_end (last slot = region_size).
+            free_slot = new_end + 1
+            if region_start <= free_slot <= region_end + 1:
+                region_delta[free_slot - region_start] -= size_free
+
+        from .memory import FreeableInputBuffer
+
+        graph_outputs = mem_ctx["graph_outputs"]
+        for bi in mem_ctx["buf_info_list"]:
+            # Conservative skip: only skip when BOTH the baseline events and
+            # the would-be new events are guaranteed outside the region. We
+            # use baseline events (start_step/end_step) for the cheap check;
+            # to stay correct when the defining node moves into the region
+            # (re-sort or group→combo_step), we additionally widen the
+            # check using the buffer's defining_op step.
+            #
+            # A buffer can only have its event remapped into the region if
+            # its defining_op is inside the region in the new schedule. So
+            # check both: baseline events and (potentially remapped) start.
+            buf_for_remap = bi.buffer
+            remap_start: int | None = None
+            if isinstance(buf_for_remap, FreeableInputBuffer):
+                # Inputs have alloc fixed at step 0; can never be remapped.
+                pass
+            else:
+                defining = buf_for_remap.defining_op
+                if defining is not None and (
+                    defining in new_step or defining in node_to_idx
+                ):
+                    cand = step_of(defining)
+                    if region_start <= cand <= region_end:
+                        remap_start = cand
+
+            latest_event = bi.start_step
+            if bi.end_step + 1 > latest_event:
+                latest_event = bi.end_step + 1
+            earliest_event = bi.start_step
+            if bi.end_step + 1 < earliest_event:
+                earliest_event = bi.end_step + 1
+
+            if remap_start is None and (
+                latest_event < region_start or earliest_event > region_end + 1
+            ):
+                continue
+
+            buf = bi.buffer
+            if isinstance(buf, FreeableInputBuffer):
+                # Freeable inputs alloc at step 0 and free after their last
+                # consumer. Skip if the input is a graph output or has no
+                # consumers (baseline already handled in carry_in).
+                succ = buf.mpi_buffer.succ_nodes
+                if not succ or buf.get_name() in graph_outputs:
+                    continue
+                new_end = max(step_of(s) for s in succ)
+                # Alloc contributes to the region only when region_start == 0.
+                # Otherwise the alloc is absorbed in carry_in, and we only
+                # need to place the free event if it lands in the region.
+                new_start = 0
+                alloc = bi.size_alloc if region_start == 0 else 0
+                accumulate(alloc, bi.size_free, new_start, new_end)
+                continue
+
+            # SchedulerBuffer: alloc step = step of defining node.
+            defining = buf.defining_op
+            if defining is None:
+                continue
+            new_start = step_of(defining)
+            succ = buf.mpi_buffer.succ_nodes
+            if buf.get_name() in graph_outputs:
+                # Graph outputs: follow baseline convention of freeing at
+                # step 0 (end_step == -1) so the alloc and free cancel in
+                # memories_at_nodes — they are fixed required memory.
+                new_end = -1
+            elif not succ:
+                # No consumer — freed right after its defining step.
+                new_end = new_start
+            else:
+                new_end = max(step_of(s) for s in succ)
+
+            accumulate(bi.size_alloc, bi.size_free, new_start, new_end)
+
+        # Carry-in: memory state right before the region starts.
+        # memories_at_nodes[t] = memory AFTER step t; so memory just before
+        # step region_start equals memories_at_nodes[region_start - 1].
+        # The cached memories_at_nodes is kept up-to-date by the caller via
+        # _commit_combo_to_memory_context after every acceptance, so this
+        # value remains correct even when group regions overlap.
+        memories_at_nodes = mem_ctx["memories_at_nodes"]
+        carry_in = memories_at_nodes[region_start - 1] if region_start > 0 else 0
+        cur = carry_in
+        region_peak = cur
+        new_region_memory: list[int] = []
+        for d in region_delta:
+            cur += d
+            new_region_memory.append(cur)
+            if cur > region_peak:
+                region_peak = cur
+
+        # Outside the region, memory at each node is unchanged (combo only
+        # moves alloc/free events inside its region). So outer_peak ≤
+        # baseline_peak, which is the running graph peak updated on every
+        # acceptance. Therefore:
+        #   actual new_peak = max(outer_peak, region_peak)
+        #                   ≤ max(baseline_peak, region_peak)
+        new_peak = max(baseline_peak, region_peak)
+        delta = new_peak - baseline_peak
+
+        # Dual threshold: accept iff delta satisfies every threshold that
+        # is set (>0). abs is bytes; pct is fraction of baseline_peak.
+        abs_thr = config.combo_kernel_peak_memory_threshold
+        pct_thr = config.combo_kernel_peak_memory_pct_threshold
+        accept = True
+        if abs_thr > 0 and delta > abs_thr:
+            accept = False
+        if pct_thr > 0 and baseline_peak > 0 and delta > pct_thr * baseline_peak:
+            accept = False
+
+        if accept:
+            log.info(
+                "ComboKernels memory-aware: accepted group of %d nodes "
+                "(peak delta %+d bytes = %.3f%%)",
+                len(group_nodes),
+                delta,
+                (100.0 * delta / baseline_peak) if baseline_peak > 0 else 0.0,
+            )
+            return combo_node, new_peak, new_region_memory, region_start
+        else:
+            log.debug(
+                "ComboKernels memory-aware: rejected group of %d nodes "
+                "(peak delta %+d bytes = %.3f%%; abs_thr=%d pct_thr=%g)",
+                len(group_nodes),
+                delta,
+                (100.0 * delta / baseline_peak) if baseline_peak > 0 else 0.0,
+                abs_thr,
+                pct_thr,
+            )
+            return None, baseline_peak, None, 0
+
+    def _commit_combo_to_memory_context(
+        self,
+        mem_ctx: dict[str, Any],
+        region_start: int,
+        new_region_memory: list[int],
+        group_nodes: list[BaseSchedulerNode] | None = None,
+    ) -> None:
+        """Refresh cached memories_at_nodes after accepting a combo group.
+
+        Combo group regions can overlap in node-index span (groups are
+        topological-level partitions, but self.nodes order may interleave
+        levels). Without this update, a later group whose carry_in lands
+        inside an earlier accepted region would read stale baseline memory
+        values. This writes the new in-region memory profile back so
+        subsequent groups see a consistent timeline. Outside-region steps
+        are unchanged (proved invariant in _try_combo_with_memory_check).
+
+        Also records each group sub-node's logical step (= region_start of
+        the new combo) so subsequent groups can resolve buffers whose
+        defining_op or successor was absorbed into this combo.
+        """
+        memories_at_nodes = mem_ctx["memories_at_nodes"]
+        end = min(region_start + len(new_region_memory), len(memories_at_nodes))
+        for i, t in enumerate(range(region_start, end)):
+            memories_at_nodes[t] = new_region_memory[i]
+        if group_nodes is not None:
+            accepted_step = mem_ctx["accepted_step"]
+            for n in group_nodes:
+                accepted_step[n] = region_start
 
     def prune_redundant_deps(self, nodes: list[BaseSchedulerNode]) -> None:
         for node in nodes:
