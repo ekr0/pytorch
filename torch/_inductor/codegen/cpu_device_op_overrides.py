@@ -24,7 +24,9 @@ class CpuDeviceOpOverrides(DeviceOpOverrides):
         return "pass"
 
     def device_guard(self, device_idx: int) -> str:
-        return "pass"
+        # Used in `with <expr>:` blocks (e.g. autotune-at-compile-time).
+        # Return a real context manager rather than a bare "pass" statement.
+        return "torch._ops.contextlib.nullcontext()"
 
 
 register_device_op_overrides("cpu", CpuDeviceOpOverrides())

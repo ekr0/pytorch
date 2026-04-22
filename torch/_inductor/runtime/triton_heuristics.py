@@ -379,6 +379,7 @@ class CachingAutotuner(KernelInterface):
         self.heuristic_type = heuristic_type
         self.custom_kernel = custom_kernel
         self.cuda_kernel_saved = False
+        self.cpu_triton_kernel_saved = False
         self.autotune_cache_info = autotune_cache_info
         if log.isEnabledFor(logging.DEBUG):
             log.debug(
@@ -1556,6 +1557,55 @@ class CachingAutotuner(KernelInterface):
         CudaKernelParamCache.set(key, params, binary, bin_type, asm, asm_type)
         self.cuda_kernel_saved = True
 
+    def save_cpu_triton_kernel(self, launcher):
+        """AOTI counterpart of save_gpu_kernel for CPU Triton kernels.
+
+        Captures the kernel `.so` and the launcher `.so` from `launcher.bin.asm`
+        and registers them in CpuTritonKernelCache. Pass-2 (CppWrapperCpu)
+        reads from that cache to emit C++ wrappers that dlopen these artifacts.
+
+        The launcher `.so` is expected to expose a `run_from_nativert` entry
+        point (see `aoti_runtime/cpu_triton_runtime_wrappers.h`). If the
+        active Triton CPU backend doesn't emit a launcher that publishes that
+        symbol, the kernel's `asm` dict won't have a `"launcher.so"` entry and
+        we abort here with a clear error -- the CPU AOTI Triton path is
+        unsupported in that case.
+        """
+        from torch._inductor.codecache import CpuTritonKernelCache
+
+        key = self.inductor_meta.get("kernel_name")
+        assert key is not None, "kernel_name can not be None"
+
+        compiled = launcher.bin
+        kernel_bytes = compiled.asm.get("so")
+        launcher_bytes = compiled.asm.get("launcher.so")
+        if kernel_bytes is None or launcher_bytes is None:
+            raise RuntimeError(
+                f"CPU AOTI does not support Triton kernels with this Triton "
+                f"CPU backend: kernel '{key}' is missing 'so' or 'launcher.so' "
+                f"in compiled.asm (got {list(compiled.asm.keys())}). The CPU "
+                f"AOTI Triton path requires a Triton CPU backend that emits a "
+                f"launcher `.so` exporting `run_from_nativert`. Workarounds: "
+                f"(1) use a Triton CPU build that emits this launcher, or "
+                f"(2) compile in JIT mode (no AOTI) for graphs that contain "
+                f"Triton kernels."
+            )
+        kernel_symbol = (
+            compiled.metadata.name
+            if hasattr(compiled.metadata, "name")
+            else compiled.metadata["name"]
+        )
+        signature = compiled.src.signature
+
+        CpuTritonKernelCache.set(
+            key,
+            kernel_bytes=kernel_bytes,
+            launcher_bytes=launcher_bytes,
+            kernel_symbol=kernel_symbol,
+            signature=signature,
+        )
+        self.cpu_triton_kernel_saved = True
+
     def coordinate_descent_tuning(self, launcher, *args, **kwargs):
         """
         Coordinate descent tuning can be run with or without max-autotune.
@@ -1799,7 +1849,11 @@ class CachingAutotuner(KernelInterface):
         # autotuning entirely, this is the only call site that records the winner.
         TritonBundler.put_winner(launcher.cache_hash)
         if launcher.store_cubin and (not benchmark_run or not self.cuda_kernel_saved):
-            self.save_gpu_kernel(stream, launcher)
+            if self.device_props.type == "cpu":
+                if not self.cpu_triton_kernel_saved:
+                    self.save_cpu_triton_kernel(launcher)
+            else:
+                self.save_gpu_kernel(stream, launcher)
 
         try:
             self._pre_launch(launcher, *args, stream=stream, **kwargs)
@@ -2486,7 +2540,10 @@ class DebugAutotuner(CachingAutotuner):
             (launcher,) = self.launchers
 
             if launcher.store_cubin:
-                self.save_gpu_kernel(stream, launcher)
+                if self.device_props.type == "cpu":
+                    self.save_cpu_triton_kernel(launcher)
+                else:
+                    self.save_gpu_kernel(stream, launcher)
 
             if self.cached is None:
                 ms = self.bench(launcher, *args, with_profiler=self.with_profiler)
