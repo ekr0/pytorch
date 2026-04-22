@@ -144,6 +144,47 @@ class DeterministicTest(TestCase):
             )
             size //= 2
 
+    @parametrize("batch_invariant", [False, True])
+    @unittest.skipIf(not HAS_GPU_AND_TRITON, "requires GPU + Triton")
+    def test_split_reduction_batch_invariance(self, batch_invariant):
+        def fn(x):
+            return x * x.mean(dim=[2, 3], keepdim=True)
+
+        torch.manual_seed(0)
+        x_full = torch.randn(16, 32, 256, 256, device=GPU_TYPE, dtype=torch.bfloat16)
+
+        with inductor_config.patch(batch_invariant=batch_invariant):
+            torch._dynamo.reset()
+            torch._inductor.metrics.generated_kernel_count = 0
+            compiled = torch.compile(fn)
+            out_full = compiled(x_full)
+            n_full = torch._inductor.metrics.generated_kernel_count
+
+            torch._dynamo.reset()
+            torch._inductor.metrics.generated_kernel_count = 0
+            compiled = torch.compile(fn)
+            out_half = compiled(x_full[:8].contiguous())
+            n_half = torch._inductor.metrics.generated_kernel_count
+
+        bitwise_equal = torch.equal(out_full[:8].contiguous(), out_half)
+
+        if batch_invariant:
+            self.assertTrue(
+                bitwise_equal, "batch_invariant failed to produce bitwise-equal output"
+            )
+            self.assertEqual(
+                n_full,
+                n_half,
+                f"batch_invariant should pin kernel count: {n_full} vs {n_half}",
+            )
+        else:
+            # without the flag, the split-reduction decision flips
+            self.assertFalse(
+                bitwise_equal,
+                "test shape no longer exercises split-reduction divergence",
+            )
+            self.assertNotEqual(n_full, n_half)
+
     def test_reorder_for_locality_preserves_randint_order(self):
         with inductor_config.patch(fallback_random=True):
 
