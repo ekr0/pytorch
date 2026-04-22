@@ -34,10 +34,11 @@ import re
 import sys
 import time
 import types
+import typing
 import weakref
 from collections.abc import Callable, MutableMapping
 from types import ModuleType
-from typing import Any, NamedTuple, NoReturn, overload, TYPE_CHECKING, Union, _UnionGenericAlias
+from typing import Any, NamedTuple, NoReturn, overload, TYPE_CHECKING, Union
 
 import sympy
 
@@ -984,8 +985,8 @@ class VariableBuilder:
                 enum.Enum,
                 torch.DispatchKey,
                 torch._C._functorch.TransformType,
-                torch._C._ScalingType,
-                torch._C._SwizzleType,
+                torch._C._ScalingType,  # type: ignore[attr-defined]  # pyrefly: ignore[missing-attribute]
+                torch._C._SwizzleType,  # type: ignore[attr-defined]  # pyrefly: ignore[missing-attribute]
             ),
         ):
             self.install_guards(GuardBuilder.ID_MATCH)
@@ -4316,8 +4317,8 @@ class SourcelessBuilder:
                 enum.Enum,
                 torch.DispatchKey,
                 torch._C._functorch.TransformType,
-                torch._C._ScalingType,
-                torch._C._SwizzleType,
+                torch._C._ScalingType,  # type: ignore[attr-defined]  # pyrefly: ignore[missing-attribute]
+                torch._C._SwizzleType,  # type: ignore[attr-defined]  # pyrefly: ignore[missing-attribute]
             ),
         ):
             return UserDefinedObjectVariable(value)
@@ -4368,7 +4369,14 @@ class SourcelessBuilder:
             return torch._dynamo.variables.higher_order_ops.FlexAttentionBackwardHighOrderVariable(
                 value
             )
-        elif isinstance(value, (types.GenericAlias, types.UnionType, _UnionGenericAlias)):
+        elif isinstance(
+            value,
+            (
+                types.GenericAlias,
+                types.UnionType,
+                typing._UnionGenericAlias,  # type: ignore[attr-defined]  # pyrefly: ignore[missing-attribute]
+            ),
+        ):
             return TypingVariable(value)
         elif is_namedtuple(value):
             output = [

@@ -1368,8 +1368,8 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                 enum.Enum,
                 torch.DispatchKey,
                 torch._C._functorch.TransformType,
-                torch._C._ScalingType,
-                torch._C._SwizzleType,
+                torch._C._ScalingType,  # type: ignore[attr-defined]  # pyrefly: ignore[missing-attribute]
+                torch._C._SwizzleType,  # type: ignore[attr-defined]  # pyrefly: ignore[missing-attribute]
             ),
         ):
             return self.value
