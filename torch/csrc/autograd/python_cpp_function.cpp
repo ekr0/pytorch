@@ -15,10 +15,12 @@
 #include <torch/csrc/autograd/python_hook.h>
 #include <torch/csrc/autograd/python_variable.h>
 #include <torch/csrc/utils/pybind.h>
+#include <torch/csrc/utils/pyobject_preservation.h>
 #include <torch/csrc/utils/python_numbers.h>
 #include <torch/csrc/utils/python_strings.h>
 
 using namespace torch::autograd;
+using torch::utils::PyObjectPreservation;
 
 namespace torch::autograd {
 
@@ -113,9 +115,11 @@ int THPCppFunction_traverse(PyObject* self, visitproc visit, void* arg) {
 
 int THPCppFunction_clear(PyObject* self) {
   auto f = (THPCppFunction*)self;
-  // Remove the weak ref of the c++ object if it exist
   if (f->cdata) {
-    f->cdata->set_pyobj(nullptr);
+    auto* slot = f->cdata->pyobj_slot();
+    if (slot->load_pyobj() == self) {
+      slot->store_pyobj(nullptr);
+    }
   }
   f->cdata.reset();
   return 0;
@@ -293,10 +297,8 @@ PyObject* functionToPyObject(const c10::intrusive_ptr<Node>& cdata) {
     return obj;
   }
 
-  if (cdata->pyobj()) {
-    Py_INCREF(cdata->pyobj());
-  } else {
-    auto& fn = *cdata;
+  return PyObjectPreservation::get_or_init(*cdata, [&]() {
+    Node& fn = *cdata;
     auto it = cpp_function_types_map.find(std::type_index(typeid(fn)));
     PyTypeObject* type = nullptr;
     if (it == cpp_function_types_map.end()) {
@@ -305,17 +307,12 @@ PyObject* functionToPyObject(const c10::intrusive_ptr<Node>& cdata) {
       type = (PyTypeObject*)it->second.get();
     }
 
-    THPObjectPtr obj(type->tp_alloc(type, 0));
-    if (!obj)
-      return nullptr;
-    THPCppFunction* f = (THPCppFunction*)obj.get();
+    THPObjectPtr new_obj(type->tp_alloc(type, 0));
+    TORCH_CHECK(new_obj, "Failed to allocate a ", type->tp_name, " object");
+    THPCppFunction* f = (THPCppFunction*)new_obj.get();
     new (&f->cdata) c10::intrusive_ptr<Node>(cdata);
-
-    // No INCREF here as we only have a weak reference
-    cdata->set_pyobj(obj.release());
-  }
-
-  return cdata->pyobj();
+    return new_obj.release();
+  });
 }
 
 void registerCppFunction(const std::type_info& type, PyTypeObject* pytype) {
