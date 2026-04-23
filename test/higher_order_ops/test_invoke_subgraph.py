@@ -4496,5 +4496,60 @@ class TestInvokeSubgraphTrainStepCapture(TestCase):
         self.assertIsNotNone(loss)
 
 
+    @torch._dynamo.config.patch(
+        trace_autograd_ops=True,
+        enable_invoke_subgraph_regional_compile=True,
+    )
+    def test_nested_region_config_propagated_to_backward(self):
+        """When joint tracing creates backward invoke_subgraph nodes,
+        the nested_region_config should be propagated so the regional
+        compiler can compile them.  Without this, backward subgraphs
+        containing HOPs like flex_attention fall through to the dense
+        CEA fallback at runtime.
+        """
+        from torch._higher_order_ops.invoke_subgraph import (
+            get_invoke_subgraph_compile_options,
+        )
+
+        config = get_invoke_subgraph_compile_options(
+            decompositions=torch._decomp.core_aten_decompositions()
+        )
+
+        @nested_compile_region(options=config)
+        def nested_fn(x):
+            return x.sin()
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4, bias=False)
+                self.head = torch.nn.Linear(4, 1, bias=False)
+
+            def forward(self, x):
+                y = self.linear(x)
+                z = nested_fn(y)
+                z_det = z.detach().requires_grad_()
+                loss = self.head(z_det).sum()
+                loss.backward()
+                z.backward(z_det.grad)
+                return loss.detach()
+
+        from torch._dynamo.backends.common import aot_autograd
+        from torch.fx.passes.regional_inductor_invoke_subgraph import (
+            regional_inductor_invoke_subgraph,
+        )
+
+        backend = aot_autograd(
+            fw_compiler=regional_inductor_invoke_subgraph,
+            bw_compiler=regional_inductor_invoke_subgraph,
+        )
+
+        model = Model()
+        x = torch.randn(4, 4)
+        compiled = torch.compile(model, backend=backend, fullgraph=True)
+        loss = compiled(x)
+        self.assertIsNotNone(loss)
+
+
 if __name__ == "__main__":
     run_tests()
