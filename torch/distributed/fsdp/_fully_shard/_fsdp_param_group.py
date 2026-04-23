@@ -481,15 +481,50 @@ class FSDPParamGroup:
                 return
         self._to_sharded()
 
+    def _reset_iter_state(self) -> None:
+        # See FSDPState._reset_iter_state for semantics. Waits on any
+        # in-flight collective events owned by this group, discards
+        # accumulated grad-reduction state, and restores sharded params.
+        current_stream = self.device_handle.current_stream()
+        if self._all_gather_result is not None:
+            if (event := self._all_gather_result.all_gather_event) is not None:
+                current_stream.wait_event(event)
+            work = self._all_gather_result.all_gather_work
+            if isinstance(work, dist.distributed_c10d.Work):
+                work.wait()
+            self._all_gather_result = None
+        if self._post_reduce_event is not None:
+            current_stream.wait_event(self._post_reduce_event)
+            self._post_reduce_event = None
+        if (
+            self._all_reduce_state is not None
+            and self._all_reduce_state.event is not None
+        ):
+            current_stream.wait_event(self._all_reduce_state.event)
+        self._all_reduce_state = None
+        if self._reshard_after_forward_event is not None:
+            self._wait_all_gather_streams_on_event(self._reshard_after_forward_event)
+            self._reshard_after_forward_event = None
+        self._partial_reduce_output = None
+        self._post_forward_indices.clear()
+        self._training_state = TrainingState.IDLE
+        self._to_sharded()
+
     def pre_forward(
         self, module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
         logger.debug("%s", self._with_fqn("FSDP::pre_forward"))
         with record_function(self._with_fqn("FSDP::pre_forward")):
+            # FORWARD at entry means another module in the grouped
+            # ``fully_shard([a, b])`` already registered post_backward this
+            # pass; skip to avoid duplicate ``RegisterPostBackwardFunction``
+            # autograd nodes.
+            entering_forward_pass = self._training_state != TrainingState.FORWARD
             self._training_state = TrainingState.FORWARD
             self.unshard(self.unshard_async_op)
             self.wait_for_unshard()
-            args, kwargs = self._register_post_backward_hook(args, kwargs)
+            if entering_forward_pass:
+                args, kwargs = self._register_post_backward_hook(args, kwargs)
             return args, kwargs
 
     def post_forward(self, module: nn.Module, input: Any, output: Any):
