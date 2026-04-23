@@ -562,6 +562,13 @@ class FSDPParamGroup:
         # This method should be idempotent and safe to call even when this
         # FSDP parameter group was not used in backward (should be a no-op)
         logger.debug("%s", self._with_fqn("FSDP::post_backward"))
+        # Chunked-loss grouped-FSDP path: when a standalone per-chunk head
+        # call triggers this post-backward, the entering state is FORWARD
+        # (the group's ``_modules_to_run`` post-hook did not run the full
+        # post_hook because not all modules in the group executed, so
+        # pre_backward was never registered or invoked). Normal backward
+        # fires with entering state == PRE_BACKWARD.
+        in_chunked_path = self._training_state == TrainingState.FORWARD
         self._training_state = TrainingState.POST_BACKWARD
         with record_function(self._with_fqn("FSDP::post_backward_accumulate")):
             for fsdp_param in self.fsdp_params:
@@ -661,6 +668,23 @@ class FSDPParamGroup:
             self.comm_ctx.reduce_scatter_states.append(
                 ReduceScatterState(reduce_scatter_input, reduce_scatter_event)
             )
+            if in_chunked_path:
+                # Chunked-loss grouped-FSDP: at post_backward exit, make the
+                # default stream wait on this chunk's post-accumulate event
+                # before returning to autograd. Without this, chunk N+1's
+                # autograd-backward kernels queue on the default stream
+                # concurrently with chunk N's accumulate on the RS stream.
+                # The caching allocator then hands an autograd kernel a
+                # block that is a live input/output of chunk N's accumulate,
+                # corrupting grads on non-zero ranks. A stream-level wait
+                # on the post-accumulate event is sufficient; a wait on the
+                # pre-accumulate reduce_scatter_event is NOT (verified on
+                # MI350X). The existing wait at the next post_backward's
+                # entry is too late because autograd runs between
+                # post_backwards. No CPU sync required.
+                self.device_handle.current_stream().wait_event(
+                    self._post_reduce_event
+                )
             if all_reduce_input is not None:
                 if self.device.type != "cpu":
                     if all_reduce_event is None:
